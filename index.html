@@ -1,0 +1,585 @@
+<meta charset="utf8" />
+ <script type="importmap">{ 
+    "imports": { 
+        "LocalSharedMemory": "./node_modules/localsharedmemory/index.js", 
+        "BigVec": "./node_modules/bigvec/index.js"
+    }}
+</script>
+
+<script type="module">
+    import StackFlow from "./index.js"
+    import SIMD from "./simd.js"
+
+    const maxModelCount = 1000;
+    const maxIndiceCount = 4096 * 256;
+    const maxAttribLength = 4096 * 1024;
+    const maxAngleStep = Math.floor((Math.PI*2) * 1e4);
+
+    class ModelIndex extends Number {}
+    class ModelOffset extends Number {}
+    class Vertex extends Number {}
+
+    class OPTYPE extends Number {}
+
+    const f32 = {
+        mul : new class f32_mul extends OPTYPE {} ( SIMD.f32_mul.type )
+    }
+
+    class Scene extends EventTarget {
+
+        BYTES_PER_ELEMENT   = 4;
+        BYTES_PER_INDICE    = 4;
+        BYTES_PER_MODEL     = this.BYTES_PER_ELEMENT;
+        ELEMENTS_PER_VERTEX = 8;
+        BYTES_PER_VERTEX    = (
+            this.BYTES_PER_ELEMENT * 
+            this.ELEMENTS_PER_VERTEX
+        );
+
+        #modelOffset = 4;
+        #modelCount = 1;
+        
+        #indexCount = 3;
+        #vertexCount = 8;
+        
+        #indexByteLength = 12;
+        #vertexByteLength = 32;
+
+        Vertex = Vertex;
+        
+        Model = class Model extends Number {
+
+            rotateX ( value ) { this.scene.addRotationX(value, this) }
+            rotateY ( value ) { this.scene.addRotationY(value, this) }
+            rotateZ ( value ) { this.scene.addRotationZ(value, this) }
+            rotateW ( value ) { this.scene.addRotationW(value, this) }
+
+            translateX ( value ) { this.scene.addPositionX(value, this) }
+            translateY ( value ) { this.scene.addPositionY(value, this) }
+            translateZ ( value ) { this.scene.addPositionZ(value, this) }
+            translateW ( value ) { this.scene.addPositionW(value, this) }
+
+            scaleX ( value ) { this.scene.addScaleX(value, this) }
+            scaleY ( value ) { this.scene.addScaleY(value, this) }
+            scaleZ ( value ) { this.scene.addScaleZ(value, this) }
+            scaleW ( value ) { this.scene.addScaleW(value, this) }
+
+            setVertex ( vertex, index ) { this.scene.setVertex( vertex, index, this ) }
+
+            get ranges () {
+                return {
+                    __proto__ : null,
+                    vertexBegin       : this.scene.vertexBegin.at(this),  
+                    vertexCount       : this.scene.vertexCount.at(this),  
+                    vertexEnd         : this.scene.vertexEnd.at(this),  
+                    vertexByteOffset  : this.scene.vertexByteOffset.at(this),          
+                    vertexByteLength  : this.scene.vertexByteLength.at(this),          
+                    vertexByteFinish  : this.scene.vertexByteFinish.at(this),          
+                    indexBegin        : this.scene.indexBegin.at(this),  
+                    indexCount        : this.scene.indexCount.at(this),  
+                    indexEnd          : this.scene.indexEnd.at(this),  
+                    indexByteOffset   : this.scene.indexByteOffset.at(this),      
+                    indexByteLength   : this.scene.indexByteLength.at(this),      
+                    indexByteFinish   : this.scene.indexByteFinish.at(this),      
+                    renderByteOffset  : this.scene.renderByteOffset.at(this),          
+                    renderByteLength  : this.scene.renderByteLength.at(this),          
+                    renderByteFinish  : this.scene.renderByteFinish.at(this),                              
+                }
+            }  
+
+            get matrixElements () {
+                return {
+                    __proto__ : null,
+                    model : {
+                        __proto__ : null,
+                        rotateX: this.scene.getRotationX(this),
+                        rotateY: this.scene.getRotationY(this),
+                        rotateZ: this.scene.getRotationZ(this),
+                        rotateW: this.scene.getRotationW(this),
+                        locateX: this.scene.getPositionX(this),
+                        locateY: this.scene.getPositionY(this),
+                        locateZ: this.scene.getPositionZ(this),
+                        locateW: this.scene.getPositionW(this),
+                        scaleX : this.scene.getScaleX(this),
+                        scaleY : this.scene.getScaleY(this),
+                        scaleZ : this.scene.getScaleZ(this),
+                        scaleW : this.scene.getScaleW(this),
+                    },
+                    world : {
+                        __proto__ : null,
+                        rotateX: this.scene.getWorldRotationX(this),
+                        rotateY: this.scene.getWorldRotationY(this),
+                        rotateZ: this.scene.getWorldRotationZ(this),
+                        rotateW: this.scene.getWorldRotationW(this),
+                        locateX: this.scene.getWorldPositionX(this),
+                        locateY: this.scene.getWorldPositionY(this),
+                        locateZ: this.scene.getWorldPositionZ(this),
+                        locateW: this.scene.getWorldPositionW(this),
+                        scaleX:  this.scene.getWorldScaleX(this),
+                        scaleY:  this.scene.getWorldScaleY(this),
+                        scaleZ:  this.scene.getWorldScaleZ(this),
+                        scaleW:  this.scene.getWorldScaleW(this),
+                    }
+                }
+            }  
+
+            setIndices ( indices = [] ) {
+                this.scene.allocIndex( this, indices.length );
+                const firstIndex = this.scene.vertexBegin.load( this );
+                this.indices.set( indices.map(v => {
+                    if (typeof v === "number") {
+                        v += firstIndex;
+                    }
+                    return v;
+                }) )
+            }
+        }
+        
+        constructor (modelCount, indexLength, attribCount, angleSteps) {
+            
+            const scene = super();
+            const proto = Object.getPrototypeOf(this);
+
+            const radAngle              = new StackFlow(Float32Array, angleSteps, "RadAngleStack");
+            const degAngle              = new StackFlow(Float32Array, angleSteps, "DegAngleStack");
+            const cosTheta              = new StackFlow(Float32Array, angleSteps, "CosThetaStack");
+            const sinTheta              = new StackFlow(Float32Array, angleSteps, "SinThetaStack");
+            const needsUpdate           = new StackFlow(Uint8Array, modelCount, "NeedsUpdateStack");
+            const needsUpload           = new StackFlow(Uint8Array, modelCount, "NeedsUploadStack");
+            const parent                = new StackFlow(Uint32Array, modelCount, "ParentStack");
+            const rotationX             = new StackFlow(Float32Array, modelCount, "RotationXStack");
+            const rotationY             = new StackFlow(Float32Array, modelCount, "RotationYStack");
+            const rotationZ             = new StackFlow(Float32Array, modelCount, "RotationZStack");
+            const rotationW             = new StackFlow(Float32Array, modelCount, "RotationWStack");
+            const positionX             = new StackFlow(Float32Array, modelCount, "PositionXStack");
+            const positionY             = new StackFlow(Float32Array, modelCount, "PositionYStack");
+            const positionZ             = new StackFlow(Float32Array, modelCount, "PositionZStack");
+            const positionW             = new StackFlow(Float32Array, modelCount, "PositionWStack");
+            const scaleX                = new StackFlow(Float32Array, modelCount, "ScaleXStack");
+            const scaleY                = new StackFlow(Float32Array, modelCount, "ScaleYStack");
+            const scaleZ                = new StackFlow(Float32Array, modelCount, "ScaleZStack");
+            const scaleW                = new StackFlow(Float32Array, modelCount, "ScaleWStack");
+            const worldRotationX        = new StackFlow(Float32Array, modelCount, "WorldRotationXStack");
+            const worldRotationY        = new StackFlow(Float32Array, modelCount, "WorldRotationYStack");
+            const worldRotationZ        = new StackFlow(Float32Array, modelCount, "WorldRotationZStack");
+            const worldRotationW        = new StackFlow(Float32Array, modelCount, "WorldRotationWStack");
+            const worldPositionX        = new StackFlow(Float32Array, modelCount, "WorldPositionXStack");
+            const worldPositionY        = new StackFlow(Float32Array, modelCount, "WorldPositionYStack");
+            const worldPositionZ        = new StackFlow(Float32Array, modelCount, "WorldPositionZStack");
+            const worldPositionW        = new StackFlow(Float32Array, modelCount, "WorldPositionWStack");
+            const worldScaleX           = new StackFlow(Float32Array, modelCount, "WorldScaleXStack");
+            const worldScaleY           = new StackFlow(Float32Array, modelCount, "WorldScaleYStack");
+            const worldScaleZ           = new StackFlow(Float32Array, modelCount, "WorldScaleZStack");
+            const worldScaleW           = new StackFlow(Float32Array, modelCount, "WorldScaleWStack");
+            const vertexBegin           = new StackFlow(Uint32Array, modelCount, "VertexBeginStack");
+            const vertexCount           = new StackFlow(Uint32Array, modelCount, "VertexCountStack");
+            const vertexEnd             = new StackFlow(Uint32Array, modelCount, "VertexEndStack");
+            const vertexByteOffset      = new StackFlow(Uint32Array, modelCount, "VertexByteOffsetStack");
+            const vertexByteLength      = new StackFlow(Uint32Array, modelCount, "VertexByteLengthStack");
+            const vertexByteFinish      = new StackFlow(Uint32Array, modelCount, "VertexByteFinishStack");
+            const renderByteOffset      = new StackFlow(Uint32Array, modelCount, "RenderByteOffsetStack");
+            const renderByteLength      = new StackFlow(Uint32Array, modelCount, "RenderByteLengthStack");
+            const renderByteFinish      = new StackFlow(Uint32Array, modelCount, "RenderByteFinishStack");
+            const indexBegin            = new StackFlow(Uint32Array, modelCount, "IndexBeginStack");
+            const indexCount            = new StackFlow(Uint32Array, modelCount, "IndexCountStack");
+            const indexEnd              = new StackFlow(Uint32Array, modelCount, "IndexEndStack");
+            const indexByteOffset       = new StackFlow(Uint32Array, modelCount, "IndexByteOffsetStack");
+            const indexByteLength       = new StackFlow(Uint32Array, modelCount, "IndexByteLengthStack");
+            const indexByteFinish       = new StackFlow(Uint32Array, modelCount, "IndexByteFinishStack");
+            const indices               = new StackFlow(Uint32Array, indexLength, "IndicesStack");
+            const vertexAttributeX      = new StackFlow(Float32Array, attribCount, "VertexAttributeXStack");
+            const vertexAttributeY      = new StackFlow(Float32Array, attribCount, "VertexAttributeYStack");
+            const vertexAttributeZ      = new StackFlow(Float32Array, attribCount, "VertexAttributeZStack");
+            const vertexAttributeW      = new StackFlow(Float32Array, attribCount, "VertexAttributeWStack");
+            const vertexAttributeR      = new StackFlow(Float32Array, attribCount, "VertexAttributeRStack");
+            const vertexAttributeG      = new StackFlow(Float32Array, attribCount, "VertexAttributeGStack");
+            const vertexAttributeB      = new StackFlow(Float32Array, attribCount, "VertexAttributeBStack");
+            const vertexAttributeA      = new StackFlow(Float32Array, attribCount, "VertexAttributeAStack");
+            const renderAttributeX      = new StackFlow(Float32Array, attribCount, "renderAttributeXStack");
+            const renderAttributeY      = new StackFlow(Float32Array, attribCount, "renderAttributeYStack");
+            const renderAttributeZ      = new StackFlow(Float32Array, attribCount, "renderAttributeZStack");
+            const renderAttributeW      = new StackFlow(Float32Array, attribCount, "renderAttributeWStack");
+            const renderAttributeR      = new StackFlow(Float32Array, attribCount, "renderAttributeRStack");
+            const renderAttributeG      = new StackFlow(Float32Array, attribCount, "renderAttributeGStack");
+            const renderAttributeB      = new StackFlow(Float32Array, attribCount, "renderAttributeBStack");
+            const renderAttributeA      = new StackFlow(Float32Array, attribCount, "renderAttributeAStack");
+
+            const sceneStacks           = { __proto__ : null,
+                indices,
+                parent,
+                radAngle,           degAngle, 
+                cosTheta,           sinTheta,
+                needsUpdate,        needsUpload,
+                rotationX,          rotationY,                 rotationZ,          rotationW,
+                positionX,          positionY,                 positionZ,          positionW,
+                scaleX,             scaleY,                       scaleZ,             scaleW,
+                worldRotationX,     worldRotationY,       worldRotationZ,     worldRotationW,
+                worldPositionX,     worldPositionY,       worldPositionZ,     worldPositionW,
+                worldScaleX,        worldScaleY,             worldScaleZ,        worldScaleW,
+                vertexBegin,        vertexCount,               vertexEnd,
+                vertexByteOffset,   vertexByteLength,   vertexByteFinish,
+                renderByteOffset,   renderByteLength,   renderByteFinish,
+                indexBegin,         indexCount,                 indexEnd,
+                indexByteOffset,    indexByteLength,     indexByteFinish,                
+                vertexAttributeX,   vertexAttributeY,   vertexAttributeZ,   vertexAttributeW,
+                vertexAttributeR,   vertexAttributeG,   vertexAttributeB,   vertexAttributeA,                
+                renderAttributeX,   renderAttributeY,   renderAttributeZ,   renderAttributeW,
+                renderAttributeR,   renderAttributeG,   renderAttributeB,   renderAttributeA,                
+            };
+
+            Object.defineProperties(proto, Object.getOwnPropertyDescriptors(sceneStacks));
+
+            const PI2 = Math.PI * 2;
+            const rad = PI2 / angleSteps;
+            const deg = 360 / angleSteps;
+            
+            let i = Math.abs(angleSteps) + 1;
+            while (--i > 0) {
+                const radian = i * rad;
+                const degree = i * deg;
+
+                cosTheta.setValue(Math.cos(radian), i);
+                sinTheta.setValue(Math.sin(radian), i);
+                degAngle.setValue(degree, i);
+                radAngle.setValue(radian, i);
+            }
+
+            for(const name in sceneStacks) {
+                const stack = sceneStacks[name];
+                Object.defineProperty(proto, stack.toLabel(`load`), { value : stack.load })
+                Object.defineProperty(proto, stack.toLabel(`store`), { value : stack.store })
+            }
+
+            Object.defineProperty( this.Model.prototype, "scene", { value: scene } )
+
+            Object.defineProperties( this.Model.prototype, {
+                vertexCount : {
+                    enumerable: true,
+                    get: function () { 
+                        return vertexCount.load(this) 
+                    }
+                }, 
+                indices : {
+                    enumerable: true,
+                    get: function () {
+                        return indices.subarray( 
+                            indexBegin.load(this), 
+                            indexEnd.load(this) 
+                        )
+                    }
+                }, 
+                vertices : {
+                    get: function () {
+                        const begin = vertexBegin.load(this);
+                        const count = vertexCount.load(this);
+                        return new Array(count).fill(begin).map((s, i) => new Vertex(s + i*4))
+                    }, enumerable: true
+                }, 
+                vertexAttributes : {
+                    enumerable: true,
+                    get: function () {
+                        const begin = vertexBegin.load(this);
+                        const end   = vertexEnd.load(this);
+
+                        return {
+                            __proto__ : null,
+                            x : vertexAttributeX.subarray(begin, end),
+                            y : vertexAttributeY.subarray(begin, end),
+                            z : vertexAttributeZ.subarray(begin, end),
+                            w : vertexAttributeW.subarray(begin, end),
+                            r : vertexAttributeR.subarray(begin, end),
+                            g : vertexAttributeG.subarray(begin, end),
+                            b : vertexAttributeB.subarray(begin, end),
+                            a : vertexAttributeA.subarray(begin, end),                            
+                        };
+
+                    }
+                }, 
+                renderAttributes : {
+                    enumerable: true,
+                    get: function () {
+                        const begin = vertexBegin.load(this);
+                        const end   = vertexEnd.load(this);
+
+                        return {
+                            __proto__ : null,
+                            x : renderAttributeX.subarray(begin, end),
+                            y : renderAttributeY.subarray(begin, end),
+                            z : renderAttributeZ.subarray(begin, end),
+                            w : renderAttributeW.subarray(begin, end),
+                            r : renderAttributeR.subarray(begin, end),
+                            g : renderAttributeG.subarray(begin, end),
+                            b : renderAttributeB.subarray(begin, end),
+                            a : renderAttributeA.subarray(begin, end),                            
+                        };
+
+                    }
+                }, 
+                parent : {
+                    enumerable: true,
+                    set: function ( value ) { parent.store(value, this) },
+                    get: function () {
+                        const index = parent.load(this);
+                        if ( !index ) return scene;
+                        else return new this.constructor( index );
+                    }
+                }, 
+            });
+
+            Object.defineProperties( this.Vertex.prototype, {
+                x : { get: function () { return vertexAttributeX.load( this ) }, enumerable: true, set: function ( value ) { vertexAttributeX.store( value || 0, this ) } }, 
+                y : { get: function () { return vertexAttributeY.load( this ) }, enumerable: true, set: function ( value ) { vertexAttributeY.store( value || 0, this ) } }, 
+                z : { get: function () { return vertexAttributeZ.load( this ) }, enumerable: true, set: function ( value ) { vertexAttributeZ.store( value || 0, this ) } }, 
+                w : { get: function () { return vertexAttributeW.load( this ) }, enumerable: true, set: function ( value ) { vertexAttributeW.store( value || 0, this ) } }, 
+                r : { get: function () { return vertexAttributeR.load( this ) }, enumerable: true, set: function ( value ) { vertexAttributeR.store( value || 0, this ) } }, 
+                g : { get: function () { return vertexAttributeG.load( this ) }, enumerable: true, set: function ( value ) { vertexAttributeG.store( value || 0, this ) } }, 
+                b : { get: function () { return vertexAttributeB.load( this ) }, enumerable: true, set: function ( value ) { vertexAttributeB.store( value || 0, this ) } }, 
+                a : { get: function () { return vertexAttributeA.load( this ) }, enumerable: true, set: function ( value ) { vertexAttributeA.store( value || 0, this ) } }, 
+            });
+        }
+
+        getVertexBegin      ( model ) { return this.vertexBegin.load(model) }
+        getVertexCount      ( model ) { return this.vertexCount.load(model) }
+        getVertexEnd        ( model ) { return this.vertexEnd.load(model) }
+        getVertexByteOffset ( model ) { return this.vertexByteOffset.load(model) }            
+        getVertexByteLength ( model ) { return this.vertexByteLength.load(model) }            
+        getVertexByteFinish ( model ) { return this.vertexByteFinish.load(model) }            
+        setVertexBegin      ( value, model ) { this.vertexBegin.store(value, model) }
+        setVertexCount      ( value, model ) { this.vertexCount.store(value, model) }
+        setVertexEnd        ( value, model ) { this.vertexEnd.store(value, model) }
+        setVertexByteOffset ( value, model ) { this.vertexByteOffset.store(value, model) }            
+        setVertexByteLength ( value, model ) { this.vertexByteLength.store(value, model) }            
+        setVertexByteFinish ( value, model ) { this.vertexByteFinish.store(value, model) }            
+        
+        getIndexBegin       ( model ) { return this.modelBegin.load(model) }        
+        getIndexCount       ( model ) { return this.modelCount.load(model) }        
+        getIndexEnd         ( model ) { return this.modelEnd.load(model) }    
+        getIndexByteOffset  ( model ) { return this.modelByteOffset.load(model) }            
+        getIndexByteLength  ( model ) { return this.modelByteLength.load(model) }            
+        getIndexByteFinish  ( model ) { return this.modelByteFinish.load(model) }            
+        setIndexBegin       ( value, model ) { this.modelBegin.store(value, model) }        
+        setIndexCount       ( value, model ) { this.modelCount.store(value, model) }        
+        setIndexEnd         ( value, model ) { this.modelEnd.store(value, model) }    
+        setIndexByteOffset  ( value, model ) { this.modelByteOffset.store(value, model) }            
+        setIndexByteLength  ( value, model ) { this.modelByteLength.store(value, model) }            
+        setIndexByteFinish  ( value, model ) { this.modelByteFinish.store(value, model) }            
+        
+        getRenderByteOffset ( model ) { return this.renderByteOffset.load(model) }            
+        getRenderByteLength ( model ) { return this.renderByteLength.load(model) }            
+        getRenderByteFinish ( model ) { return this.renderByteFinish.load(model) }            
+        setRenderByteOffset ( value, model ) { this.renderByteOffset.store(value, model) }            
+        setRenderByteLength ( value, model ) { this.renderByteLength.store(value, model) }            
+        setRenderByteFinish ( value, model ) { this.renderByteFinish.store(value, model) }            
+
+        getParent           ( model ) { return this.parent.load(model) }  
+        setParent           ( value, model ) { this.parent.store(value, model) }  
+
+        getRotationX        ( model ) { return this.rotationX.load(model) }  
+        getRotationY        ( model ) { return this.rotationY.load(model) }  
+        getRotationZ        ( model ) { return this.rotationZ.load(model) }  
+        getRotationW        ( model ) { return this.rotationW.load(model) }  
+        getPositionX        ( model ) { return this.positionX.load(model) }  
+        getPositionY        ( model ) { return this.positionY.load(model) }  
+        getPositionZ        ( model ) { return this.positionZ.load(model) }  
+        getPositionW        ( model ) { return this.positionW.load(model) }  
+        getScaleX           ( model ) { return this.scaleX.load(model) }  
+        getScaleY           ( model ) { return this.scaleY.load(model) }  
+        getScaleZ           ( model ) { return this.scaleZ.load(model) }  
+        getScaleW           ( model ) { return this.scaleW.load(model) }  
+        setRotationX        ( value, model ) { this.rotationX.store(value, model) }  
+        setRotationY        ( value, model ) { this.rotationY.store(value, model) }  
+        setRotationZ        ( value, model ) { this.rotationZ.store(value, model) }  
+        setRotationW        ( value, model ) { this.rotationW.store(value, model) }  
+        setPositionX        ( value, model ) { this.positionX.store(value, model) }  
+        setPositionY        ( value, model ) { this.positionY.store(value, model) }  
+        setPositionZ        ( value, model ) { this.positionZ.store(value, model) }  
+        setPositionW        ( value, model ) { this.positionW.store(value, model) }  
+        setScaleX           ( value, model ) { this.scaleX.store(value, model) }  
+        setScaleY           ( value, model ) { this.scaleY.store(value, model) }  
+        setScaleZ           ( value, model ) { this.scaleZ.store(value, model) }  
+        setScaleW           ( value, model ) { this.scaleW.store(value, model) }  
+        addRotationX        ( value, model ) { this.rotationX.store(this.getRotationX(model) + (value || 0), model) }  
+        addRotationY        ( value, model ) { this.rotationY.store(this.getRotationY(model) + (value || 0), model) }  
+        addRotationZ        ( value, model ) { this.rotationZ.store(this.getRotationZ(model) + (value || 0), model) }  
+        addRotationW        ( value, model ) { this.rotationW.store(this.getRotationW(model) + (value || 0), model) }  
+        addPositionX        ( value, model ) { this.positionX.store(this.getPositionX(model) + (value || 0), model) }  
+        addPositionY        ( value, model ) { this.positionY.store(this.getPositionY(model) + (value || 0), model) }  
+        addPositionZ        ( value, model ) { this.positionZ.store(this.getPositionZ(model) + (value || 0), model) }  
+        addPositionW        ( value, model ) { this.positionW.store(this.getPositionW(model) + (value || 0), model) }  
+        addScaleX           ( value, model ) { this.scaleX.store(this.getScaleX(model) + (value || 0), model) }  
+        addScaleY           ( value, model ) { this.scaleY.store(this.getScaleY(model) + (value || 0), model) }  
+        addScaleZ           ( value, model ) { this.scaleZ.store(this.getScaleZ(model) + (value || 0), model) }  
+        addScaleW           ( value, model ) { this.scaleW.store(this.getScaleW(model) + (value || 0), model) }  
+
+        scaleVerticesX      ( value, model ) {
+            const byteOffset = this.vertexByteOffset.load(model);
+            const byteLength = this.vertexByteLength.load(model);
+
+            
+            const srcByteOffset = byteOffset + this.vertexAttributeX;
+            const dstByteOffset = byteOffset + this.renderAttributeX;
+            
+            console.warn({byteOffset, dstByteOffset, srcByteOffset, byteLength, value})
+            SIMD.queueCalc( 
+                f32.mul, 
+                dstByteOffset.stack(Uint32Array), 
+                srcByteOffset.stack(Uint32Array), 
+                byteLength.stack(Uint32Array), 
+                value.stack(Float32Array) 
+            );
+        }
+
+        getWorldRotationX   ( model ) { return this.worldRotationX.load(model) }  
+        getWorldRotationY   ( model ) { return this.worldRotationY.load(model) }  
+        getWorldRotationZ   ( model ) { return this.worldRotationZ.load(model) }  
+        getWorldRotationW   ( model ) { return this.worldRotationW.load(model) }  
+        getWorldPositionX   ( model ) { return this.worldPositionX.load(model) }  
+        getWorldPositionY   ( model ) { return this.worldPositionY.load(model) }  
+        getWorldPositionZ   ( model ) { return this.worldPositionZ.load(model) }  
+        getWorldPositionW   ( model ) { return this.worldPositionW.load(model) }  
+        getWorldScaleX      ( model ) { return this.worldScaleX.load(model) }  
+        getWorldScaleY      ( model ) { return this.worldScaleY.load(model) }  
+        getWorldScaleZ      ( model ) { return this.worldScaleZ.load(model) }  
+        getWorldScaleW      ( model ) { return this.worldScaleW.load(model) }  
+        setWorldRotationX   ( value, model ) { this.worldRotationX.store(value, model) }  
+        setWorldRotationY   ( value, model ) { this.worldRotationY.store(value, model) }  
+        setWorldRotationZ   ( value, model ) { this.worldRotationZ.store(value, model) }  
+        setWorldRotationW   ( value, model ) { this.worldRotationW.store(value, model) }  
+        setWorldPositionX   ( value, model ) { this.worldPositionX.store(value, model) }  
+        setWorldPositionY   ( value, model ) { this.worldPositionY.store(value, model) }  
+        setWorldPositionZ   ( value, model ) { this.worldPositionZ.store(value, model) }  
+        setWorldPositionW   ( value, model ) { this.worldPositionW.store(value, model) }  
+        setWorldScaleX      ( value, model ) { this.worldScaleX.store(value, model) }  
+        setWorldScaleY      ( value, model ) { this.worldScaleY.store(value, model) }  
+        setWorldScaleZ      ( value, model ) { this.worldScaleZ.store(value, model) }  
+        setWorldScaleW      ( value, model ) { this.worldScaleW.store(value, model) }  
+
+        allocVertex ( count = 1, tagName ) {
+            const modelOffset       = this.#modelOffset;
+            const modelIndex        = this.#modelCount;
+
+            this.#modelOffset       += this.BYTES_PER_MODEL;
+            this.#modelCount        += 1;
+
+            const vertexBegin       = this.#vertexCount;
+            const vertexCount       = count;
+            const vertexEnd         = vertexBegin + vertexCount;
+
+            const vertexByteOffset  = this.#vertexByteLength;
+            const vertexByteLength  = count * Float32Array.BYTES_PER_ELEMENT;
+            const vertexByteFinish  = vertexByteOffset + vertexByteLength;
+
+            this.vertexBegin.store(vertexBegin, modelOffset);
+            this.vertexCount.store(vertexCount, modelOffset);
+            this.vertexEnd.store(vertexEnd, modelOffset);
+
+            this.vertexByteOffset.store(vertexByteOffset, modelOffset);
+            this.vertexByteLength.store(vertexByteLength, modelOffset);
+            this.vertexByteFinish.store(vertexByteFinish, modelOffset);
+
+            this.#vertexCount       += vertexCount;
+            this.#vertexByteLength  += vertexByteLength;
+
+            const model = new this.Model(modelOffset);
+
+            if (tagName) {
+                const extender = class extends this.Model {}
+                Object.defineProperty(extender.prototype, Symbol.toStringTag, {value: tagName})
+                Object.setPrototypeOf(model, extender.prototype)
+            }
+
+            return model;
+        }
+
+        allocIndex (model, count = 3) {
+            const indexBegin       = this.#indexCount;
+            const indexCount       = count;
+            const indexEnd         = indexBegin + indexCount;
+            const indexByteOffset  = this.#indexByteLength;
+            const indexByteLength  = indexCount * this.BYTES_PER_INDICE;
+            const indexByteFinish  = indexByteOffset + indexByteLength;
+
+            this.indexBegin.store(indexBegin, model);
+            this.indexCount.store(indexCount, model);
+            this.indexEnd.store(indexEnd, model);
+            this.indexByteOffset.store(indexByteOffset, model);
+            this.indexByteLength.store(indexByteLength, model);
+            this.indexByteFinish.store(indexByteFinish, model);
+
+            this.#indexCount       += indexCount;
+            this.#indexByteLength  += indexByteLength;
+        }
+    }
+
+    self.scene = new Scene(
+        maxModelCount, 
+        maxIndiceCount, 
+        maxAttribLength,
+        maxAngleStep
+    );
+
+    const modelAVertices = [
+        { x: -0.3, y: +0.3, z: +0.1 }, { x: +0.3, y: +0.3, z: +0.1 },
+        { x: -0.3, y: -0.3, z: +0.1 }, { x: +0.3, y: -0.3, z: +0.1 },
+        { x: -0.3, y: +0.3, z: -0.1 }, { x: +0.3, y: +0.3, z: -0.1 },
+        { x: -0.3, y: -0.3, z: -0.1 }, { x: +0.3, y: -0.3, z: -0.1 },
+    ];
+
+    const modelBVertices = [
+        { x: -0.1, y: +0.1, z: +0.1 }, { x: +0.1, y: +0.1, z: +0.1 },
+        { x: -0.1, y: -0.1, z: +0.1 }, { x: +0.1, y: -0.1, z: +0.1 },
+        { x: -0.1, y: +0.1, z: -0.1 }, { x: +0.1, y: +0.1, z: -0.1 },
+        { x: -0.1, y: -0.1, z: -0.1 }, { x: +0.1, y: -0.1, z: -0.1 },
+    ];
+
+    const modelCVertices = [
+        { x: -0.4, y: +0.4, z: +0.1 }, { x: +0.4, y: +0.4, z: +0.1 },
+        { x: -0.4, y: -0.4, z: +0.1 }, { x: +0.4, y: -0.4, z: +0.1 },
+        { x: -0.4, y: +0.4, z: -0.1 }, { x: +0.4, y: +0.4, z: -0.1 },
+        { x: -0.4, y: -0.4, z: -0.1 }, { x: +0.4, y: -0.4, z: -0.1 },
+    ];
+
+    const modelDVertices = [
+        { x: +0.2, y: +0.1, z: +0.1 }, { x: +0.3, y: +0.1, z: +0.1 },
+        { x: +0.2, y: -0.1, z: +0.1 }, { x: +0.3, y: -0.1, z: +0.1 },
+        { x: +0.2, y: +0.1, z: -0.1 }, { x: +0.3, y: +0.1, z: -0.1 },
+        { x: +0.2, y: -0.1, z: -0.1 }, { x: +0.3, y: -0.1, z: -0.1 },
+    ];
+
+    self.modelA = scene.allocVertex(8, "A -> {InTheMiddle}");
+    self.modelB = scene.allocVertex(8, "B -> {InnerCube}");
+    self.modelC = scene.allocVertex(8, "C -> {MainCube}");
+    self.modelD = scene.allocVertex(8, "D -> {ExternalCube}");
+
+    modelB.parent = modelA;
+    modelA.parent = modelC;
+    modelD.parent = modelC;
+
+    const models = [
+        [modelA, modelAVertices],
+        [modelB, modelBVertices],
+        [modelC, modelCVertices],
+        [modelD, modelDVertices],
+    ];
+
+    models.forEach(([m, vs], g) => {
+        vs.forEach((attrs, i) => {
+            const v = m.vertices.at(i);
+            attrs.r = attrs.a = attrs.w = 1;
+            attrs.g = g / 255;
+            for (const a in attrs) v[a] = attrs[a];
+        })
+    });
+
+    scene.setRotationX(2.1, 4)
+
+    setTimeout(() => {
+        scene.scaleVerticesX( 2000, modelA );
+        console.warn(modelA.attributes)
+    }, 100)
+
+    console.warn(blocks)
+    console.log({ modelA, modelB, modelC, modelD })
+
+
+</script>
